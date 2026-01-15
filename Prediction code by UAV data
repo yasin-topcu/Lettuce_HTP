@@ -1,0 +1,261 @@
+#!/usr/bin/env Rscript
+# ============================================================
+# 03_ridge_prediction_flight_scenarios.R
+# Ridge regression prediction using UAV 30 m traits
+# - 420 predefined CV splits
+# - Multiple flight (DAP) removal scenarios
+# - Global + per-genotype performance metrics
+# ============================================================
+
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(caret)
+  library(glmnet)
+  library(ggplot2)
+})
+
+set.seed(1)
+
+# ----------------------------
+# 0) Paths (GitHub friendly)
+# ----------------------------
+DATA_DIR <- "data"
+SPLIT_DIR <- "data/splits"
+OUT_DIR  <- "outputs"
+OUT_TAB  <- file.path(OUT_DIR, "tables")
+OUT_FIG  <- file.path(OUT_DIR, "figures")
+
+dir.create(OUT_TAB, showWarnings = FALSE, recursive = TRUE)
+dir.create(OUT_FIG, showWarnings = FALSE, recursive = TRUE)
+
+data_file  <- file.path(DATA_DIR, "df_all.csv")
+split_file <- file.path(SPLIT_DIR, "splits_420_pairings_4fold.rds")
+
+stopifnot(file.exists(data_file))
+stopifnot(file.exists(split_file))
+
+# ----------------------------
+# 1) Read and filter data
+# ----------------------------
+df_all <- read.csv(data_file, row.names = 1)
+
+df_all <- df_all %>%
+  filter(
+    Gen != 8,
+    !is.na(Weight),
+    Weight >= 100,
+    Weight <= 700
+  )
+
+# Only 30 m flights
+df_30m <- df_all %>%
+  select(
+    PlotID,
+    Gen,
+    Weight,
+    ends_with("30m")
+  )
+
+# ----------------------------
+# 2) Read CV split list
+# ----------------------------
+splits_list <- readRDS(split_file)
+stopifnot(length(splits_list) == 420)
+
+# ----------------------------
+# 3) Flight (DAP) scenarios
+# ----------------------------
+drop_sets <- list(
+  character(0),
+  c("DAP54"),
+  c("DAP54", "DAP51"),
+  c("DAP54", "DAP51", "DAP48"),
+  c("DAP54", "DAP51", "DAP48", "DAP41"),
+  c("DAP54", "DAP51", "DAP48", "DAP41", "DAP34")
+)
+
+flight_labels <- c(
+  "26, 34, 41, 48, 51, 54",
+  "26, 34, 41, 48, 51",
+  "26, 34, 41, 48",
+  "26, 34, 41",
+  "26, 34",
+  "26"
+)
+
+# ----------------------------
+# 4) Ridge setup
+# ----------------------------
+ridge_grid <- expand.grid(
+  alpha  = 0,
+  lambda = seq(0, 1, by = 0.1)
+)
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE
+)
+
+all_results_by_gen <- list()
+
+# ----------------------------
+# 5) Outer loop: flight scenarios
+# ----------------------------
+for (s in seq_along(drop_sets)) {
+
+  message("\n==============================")
+  message("Scenario ", s)
+  message("Remaining flights: ", flight_labels[s])
+  message("==============================")
+
+  df <- df_30m
+
+  if (length(drop_sets[[s]]) > 0) {
+    pattern_to_drop <- paste(drop_sets[[s]], collapse = "|")
+    df <- df %>% select(-matches(pattern_to_drop))
+  }
+
+  predictor_cols <- setdiff(names(df), c("PlotID", "Gen", "Weight"))
+  response_col   <- "Weight"
+
+  # Median imputation
+  preproc <- preProcess(df[, predictor_cols], method = "medianImpute")
+  df_imp  <- df
+  df_imp[, predictor_cols] <- predict(preproc, df[, predictor_cols])
+
+  ridge_results <- data.frame(
+    iteration = seq_along(splits_list),
+    cor  = NA_real_,
+    rmse = NA_real_,
+    mae  = NA_real_
+  )
+
+  ridge_results_by_gen <- vector("list", length(splits_list))
+
+  # ----------------------------
+  # 6) Inner loop: 420 splits
+  # ----------------------------
+  for (i in seq_along(splits_list)) {
+
+    train_plots <- splits_list[[i]]$train_plots
+    test_plots  <- splits_list[[i]]$test_plots
+
+    train_data <- df_imp %>% filter(PlotID %in% train_plots)
+    test_data  <- df_imp %>% filter(PlotID %in% test_plots)
+
+    ridge_fit <- train(
+      x = train_data[, predictor_cols],
+      y = train_data[[response_col]],
+      method = "glmnet",
+      trControl = ctrl,
+      tuneGrid = ridge_grid,
+      preProcess = c("center", "scale")
+    )
+
+    pred_test <- predict(ridge_fit, test_data[, predictor_cols])
+
+    y_test <- test_data[[response_col]]
+
+    ridge_results$cor[i]  <- cor(y_test, pred_test, use = "complete.obs")
+    ridge_results$rmse[i] <- sqrt(mean((y_test - pred_test)^2, na.rm = TRUE))
+    ridge_results$mae[i]  <- mean(abs(y_test - pred_test), na.rm = TRUE)
+
+    ridge_results_by_gen[[i]] <-
+      test_data %>%
+      mutate(y_obs = y_test, y_pred = pred_test) %>%
+      group_by(Gen) %>%
+      summarise(
+        n_plots = n(),
+        cor     = ifelse(n_plots > 1, cor(y_obs, y_pred), NA_real_),
+        rmse    = sqrt(mean((y_obs - y_pred)^2)),
+        mae     = mean(abs(y_obs - y_pred)),
+        iteration = i,
+        .groups = "drop"
+      )
+  }
+
+  # ----------------------------
+  # 7) Save scenario results
+  # ----------------------------
+  ridge_results$Flights <- flight_labels[s]
+
+  write.csv(
+    ridge_results,
+    file.path(OUT_TAB,
+              paste0("ridge_GLOBAL_metrics_Flights_",
+                     gsub(", ", "_", flight_labels[s]), ".csv")),
+    row.names = FALSE
+  )
+
+  ridge_results_by_gen_df <- bind_rows(ridge_results_by_gen) %>%
+    mutate(Flights = flight_labels[s])
+
+  write.csv(
+    ridge_results_by_gen_df,
+    file.path(OUT_TAB,
+              paste0("ridge_results_by_gen_Flights_",
+                     gsub(", ", "_", flight_labels[s]), ".csv")),
+    row.names = FALSE
+  )
+
+  all_results_by_gen[[s]] <- ridge_results_by_gen_df
+}
+
+# ----------------------------
+# 8) Combine all scenarios
+# ----------------------------
+all_results_by_gen_df <- bind_rows(all_results_by_gen)
+
+write.csv(
+  all_results_by_gen_df,
+  file.path(OUT_TAB, "ridge_results_by_gen_ALL_FlightScenarios.csv"),
+  row.names = FALSE
+)
+
+# ----------------------------
+# 9) Summary + plot
+# ----------------------------
+gen_flight_summary <- all_results_by_gen_df %>%
+  group_by(Gen, Flights) %>%
+  summarise(
+    mean_cor = mean(cor, na.rm = TRUE),
+    sd_cor   = sd(cor, na.rm = TRUE),
+    mean_n   = mean(n_plots),
+    .groups  = "drop"
+  )
+
+flight_order <- flight_labels
+
+gen_flight_summary <- gen_flight_summary %>%
+  mutate(Flights = factor(Flights, levels = flight_order))
+
+p <- ggplot(gen_flight_summary,
+            aes(x = factor(Gen), y = mean_cor, fill = Flights)) +
+  geom_col(position = position_dodge(0.85), width = 0.8) +
+  geom_errorbar(
+    aes(ymin = mean_cor - sd_cor, ymax = mean_cor + sd_cor),
+    position = position_dodge(0.85),
+    width = 0.2
+  ) +
+  geom_text(
+    aes(label = sprintf("%.2f ± %.2f", mean_cor, sd_cor), y = 0.05),
+    angle = 90,
+    position = position_dodge(0.85),
+    size = 4
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    x = "Genotype",
+    y = "Mean test-set correlation (± SD)",
+    fill = "Flights"
+  )
+
+ggsave(
+  file.path(OUT_FIG, "Genotype_prediction_accuracy_by_flights.png"),
+  p, width = 9, height = 6, dpi = 300
+)
+
+message("Done.")
