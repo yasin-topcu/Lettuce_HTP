@@ -1,0 +1,299 @@
+#!/usr/bin/env Rscript
+# ============================================================
+# 01_analysis_blues_cor.R
+# Genotype BLUEs + Fisher letters (nlme AR1) + trait correlations
+# Input:  data/df_RGB.csv
+# Output: outputs/ (csv + figures + RDS objects)
+# ============================================================
+
+# ----------------------------
+# 0) Setup
+# ----------------------------
+rm(list = ls())
+
+# Reproducibility (mostly for plotting jitter etc. if added later)
+set.seed(1)
+
+# Packages
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(nlme)
+  library(emmeans)
+  library(multcomp)   # cld()
+  library(ggplot2)
+  library(GGally)
+})
+
+# Paths (GitHub friendly)
+# - Put df_RGB.csv under: data/df_RGB.csv
+DATA_DIR <- "data"
+OUT_DIR  <- "outputs"
+FIG_DIR  <- file.path(OUT_DIR, "figures")
+RDS_DIR  <- file.path(OUT_DIR, "rds")
+
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(RDS_DIR, showWarnings = FALSE, recursive = TRUE)
+
+DATA_FILE <- file.path(DATA_DIR, "df_RGB.csv")
+stopifnot(file.exists(DATA_FILE))
+
+message("Reading: ", DATA_FILE)
+
+# ----------------------------
+# 1) Read data
+# ----------------------------
+df <- read.csv(DATA_FILE, stringsAsFactors = FALSE)
+
+# IMPORTANT NOTE:
+# Only use distinct() if PlotID truly identifies unique plants/rows.
+# If PlotID is not unique, this will DROP records.
+if ("PlotID" %in% names(df)) {
+  df <- df %>% distinct(PlotID, .keep_all = TRUE)
+} else {
+  warning("PlotID column not found; skipping distinct(PlotID).")
+}
+
+# ----------------------------
+# 2) Create derived traits + clean types
+# ----------------------------
+needed_cols_for_means <- c("SPAD1","SPAD2","SPAD3","Diameter1","Diameter2")
+missing_means <- setdiff(needed_cols_for_means, names(df))
+if (length(missing_means) > 0) {
+  stop("Missing columns needed for derived means: ", paste(missing_means, collapse = ", "))
+}
+
+df <- df %>%
+  mutate(
+    Gen       = factor(Gen),
+    Rep       = factor(Rep),
+    Blok      = factor(Blok),
+    PlantPos  = suppressWarnings(as.integer(Plant)),
+    h         = suppressWarnings(as.numeric(h)),
+    SPAD_mean = rowMeans(cbind(SPAD1, SPAD2, SPAD3), na.rm = TRUE),
+    Diam_mean = rowMeans(cbind(Diameter1, Diameter2), na.rm = TRUE)
+  )
+
+# Traits to analyze
+traits <- c("Weight", "SPAD_mean", "Diam_mean", "Leaf.number", "L", "C", "h")
+
+missing_traits <- setdiff(traits, names(df))
+if (length(missing_traits) > 0) {
+  stop("These traits are missing in df: ", paste(missing_traits, collapse = ", "))
+}
+
+# ----------------------------
+# 3) Function: fit model + return BLUEs + letters
+# ----------------------------
+fit_trait <- function(dat, response, letters_vec = letters) {
+
+  needed <- c(response, "Gen", "Rep", "Blok", "PlantPos")
+
+  # Keep only needed columns and complete cases for those columns
+  d <- dat %>%
+    select(all_of(needed)) %>%
+    filter(if_all(all_of(needed), ~ !is.na(.))) %>%
+    arrange(Rep, Blok, PlantPos)
+
+  if (nrow(d) == 0) return(NULL)
+
+  # If PlantPos has <2 unique values within any Rep/Blok, AR1 may fail
+  # We'll try AR1 first; if it fails, fall back to no correlation.
+  form_fixed <- as.formula(paste0(response, " ~ Gen"))
+
+  fit_ar1 <- tryCatch(
+    lme(
+      fixed = form_fixed,
+      random = ~ 1 | Rep/Blok,
+      correlation = corAR1(form = ~ PlantPos | Rep/Blok),
+      data = d,
+      method = "REML"
+    ),
+    error = function(e) NULL
+  )
+
+  m <- fit_ar1
+  used_ar1 <- TRUE
+
+  if (is.null(m)) {
+    used_ar1 <- FALSE
+    m <- lme(
+      fixed = form_fixed,
+      random = ~ 1 | Rep/Blok,
+      data = d,
+      method = "REML"
+    )
+  }
+
+  # ANOVA for genotype effect
+  aov_tab <- anova(m)
+  p_gen <- NA_real_
+  if ("Gen" %in% rownames(aov_tab)) {
+    p_gen <- aov_tab["Gen", "p-value"]
+  }
+
+  # BLUEs (emmeans) + SE/CI
+  emm  <- emmeans(m, ~ Gen)
+  blue <- as.data.frame(summary(emm))  # Gen, emmean, SE, df, lower.CL, upper.CL
+
+  # Fisher/LSD letters (unadjusted)
+  cld_df <- as.data.frame(multcomp::cld(emm, Letters = letters_vec, adjust = "none"))
+
+  out <- blue %>%
+    left_join(cld_df %>% select(Gen, .group), by = "Gen") %>%
+    mutate(
+      Trait      = response,
+      Gen_pvalue = p_gen,
+      AR1_used   = used_ar1
+    ) %>%
+    relocate(Trait, Gen, Gen_pvalue, AR1_used)
+
+  list(model = m, anova = aov_tab, results = out)
+}
+
+# ----------------------------
+# 4) Run all traits
+# ----------------------------
+all_results <- list()
+anova_list  <- list()
+model_list  <- list()
+
+for (tr in traits) {
+  message("Running trait: ", tr)
+
+  res <- tryCatch(
+    fit_trait(df, tr),
+    error = function(e) {
+      message("Trait failed: ", tr, " | ", e$message)
+      NULL
+    }
+  )
+
+  if (!is.null(res)) {
+    all_results[[tr]] <- res$results
+    anova_list[[tr]]  <- res$anova
+    model_list[[tr]]  <- res$model
+  }
+}
+
+final_table <- bind_rows(all_results)
+
+# ----------------------------
+# 5) Save outputs (tables + model objects)
+# ----------------------------
+out_csv_blues <- file.path(OUT_DIR, "Genotype_BLUEs_FisherLetters_AllTraits.csv")
+write.csv(final_table, out_csv_blues, row.names = FALSE)
+
+anova_df <- bind_rows(
+  lapply(names(anova_list), function(tr) {
+    a <- as.data.frame(anova_list[[tr]])
+    a$Effect <- rownames(anova_list[[tr]])
+    a$Trait  <- tr
+    rownames(a) <- NULL
+    a
+  })
+) %>% relocate(Trait, Effect)
+
+out_csv_anova <- file.path(OUT_DIR, "ANOVA_tables_AllTraits.csv")
+write.csv(anova_df, out_csv_anova, row.names = FALSE)
+
+# Save models too (so results are fully reproducible)
+saveRDS(model_list, file.path(RDS_DIR, "nlme_models_by_trait.rds"))
+
+message("Saved: ", out_csv_blues)
+message("Saved: ", out_csv_anova)
+message("Saved: ", file.path(RDS_DIR, "nlme_models_by_trait.rds"))
+
+# ----------------------------
+# 6) Plot: BLUEs ± SE + letters
+# ----------------------------
+# Make genotype factor ordered numerically if possible
+gen_as_int <- suppressWarnings(as.integer(as.character(final_table$Gen)))
+if (!all(is.na(gen_as_int))) {
+  gen_levels <- sort(unique(gen_as_int))
+  gen_levels <- gen_levels[!is.na(gen_levels)]
+  final_table$Gen <- factor(final_table$Gen, levels = as.character(gen_levels))
+}
+
+plot_df <- final_table %>%
+  mutate(
+    Trait_label = case_when(
+      Trait == "Weight"      ~ "Weight (g)",
+      Trait == "SPAD_mean"   ~ "SPAD",
+      Trait == "Diam_mean"   ~ "Stem\ndiameter (mm)",
+      Trait == "Leaf.number" ~ "Leaf\nnumber",
+      Trait == "L"           ~ "L",
+      Trait == "C"           ~ "C",
+      Trait == "h"           ~ "h",
+      TRUE ~ Trait
+    ),
+    ymin = emmean - SE,
+    ymax = emmean + SE
+  )
+
+p_letters <- ggplot(plot_df, aes(x = Gen, y = emmean)) +
+  geom_errorbar(aes(ymin = ymin, ymax = ymax), width = 0.15) +
+  geom_point(size = 2) +
+  geom_text(aes(label = .group, y = ymax), hjust = -0.1, size = 3, angle = 90) +
+  facet_wrap(~ Trait_label, scales = "free_y", ncol = 3) +
+  labs(x = "Genotype", y = "BLUE (± SE)") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.30))) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+fig_blues <- file.path(FIG_DIR, "Genotype_BLUEs_SE_facet.jpeg")
+ggsave(fig_blues, p_letters, width = 7, height = 7, dpi = 300)
+message("Saved figure: ", fig_blues)
+
+# ----------------------------
+# 7) Correlation plot (remove Gen 8 + IQR outliers)
+# ----------------------------
+rm_outliers_iqr <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  low <- q1 - 1.5 * iqr
+  high <- q3 + 1.5 * iqr
+  x >= low & x <= high
+}
+
+# Note: Gen is factor; compare to "8" to be safe
+cor_df <- df %>%
+  filter(as.character(Gen) != "8") %>%
+  filter(
+    rm_outliers_iqr(Weight),
+    rm_outliers_iqr(SPAD_mean),
+    rm_outliers_iqr(Diam_mean),
+    rm_outliers_iqr(Leaf.number),
+    rm_outliers_iqr(L),
+    rm_outliers_iqr(C),
+    rm_outliers_iqr(h)
+  ) %>%
+  transmute(
+    `Weight (g)`          = Weight,
+    `SPAD`                = SPAD_mean,
+    `Stem\ndiameter (mm)` = Diam_mean,
+    `Leaf\nnumber`        = Leaf.number,
+    `L`                   = L,
+    `C`                   = C,
+    `h`                   = h
+  )
+
+cc <- ggpairs(
+  cor_df,
+  upper = list(continuous = wrap("points", alpha = 0.4, size = 0.8)),
+  lower = list(continuous = wrap("cor", size = 5)),
+  diag  = list(continuous = wrap("densityDiag", alpha = 0.3))
+) + theme_bw()
+
+fig_cor <- file.path(FIG_DIR, "Correlation_last.jpeg")
+ggsave(fig_cor, cc, width = 8, height = 7, dpi = 300)
+message("Saved figure: ", fig_cor)
+
+# ----------------------------
+# 8) Print final table (useful interactively)
+# ----------------------------
+final_table
