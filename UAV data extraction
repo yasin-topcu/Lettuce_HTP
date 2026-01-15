@@ -1,0 +1,174 @@
+#!/usr/bin/env Rscript
+# ============================================================
+# 02_rgb_mask_pixel_index.R
+# - Read RGB orthomosaic (.tif) + plot shapefile (.shp)
+# - Match CRS, crop+mask to polygons
+# - Remove soil with fieldMask (HUE)
+# - Save masked raster + canopy pixel counts + RGB indices info
+# - This is one representative example demonstrating how UAV-based data were extracted from an RGB orthomosaic acquired at 30 m above ground level on 24 March 2025.
+# ============================================================
+
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(FIELDimageR)
+  library(FIELDimageR.Extra)
+  library(terra)
+  library(sf)
+  library(ggplot2)
+})
+
+# ----------------------------
+# 0) Paths (GitHub friendly)
+# ----------------------------
+# Recommended repo structure:
+# your-repo/
+#   data/
+#     RGB/
+#       <flight_folder>/
+#         orthomosaic.tif
+#         shp.lettuce2_numbered.shp (+ .dbf/.shx/.prj)
+#   scripts/
+#   outputs/
+#     rasters/
+#     tables/
+#     figures/
+
+DATA_DIR <- "data"
+OUT_DIR  <- "outputs"
+OUT_RAS  <- file.path(OUT_DIR, "rasters")
+OUT_TAB  <- file.path(OUT_DIR, "tables")
+OUT_FIG  <- file.path(OUT_DIR, "figures")
+
+dir.create(OUT_RAS, showWarnings = FALSE, recursive = TRUE)
+dir.create(OUT_TAB, showWarnings = FALSE, recursive = TRUE)
+dir.create(OUT_FIG, showWarnings = FALSE, recursive = TRUE)
+
+# ---- Edit these two lines to match your repo ----
+flight_dir <- file.path(DATA_DIR, "RGB", "RGB_DJI_202503241214_038_30m")
+rgb_tif    <- file.path(flight_dir, "RGB_DJI_202503241214_038_30m.tif")
+shp_file   <- file.path(flight_dir, "shp.lettuce2_numbered.shp")
+
+stopifnot(file.exists(rgb_tif))
+stopifnot(file.exists(shp_file))
+
+message("RGB tif : ", rgb_tif)
+message("Shapefile: ", shp_file)
+
+# ----------------------------
+# 1) Read data
+# ----------------------------
+EX1  <- terra::rast(rgb_tif)
+shps <- sf::st_read(shp_file, quiet = TRUE)
+
+# Optional quick view (interactive)
+# FIELDimageR::fieldView(mosaic = EX1, fieldShape = shps, type = 2, alpha = 0.2)
+
+# ----------------------------
+# 2) Clean shapes + CRS match
+# ----------------------------
+# Remove empty geometries and fix invalid ones if needed
+shps <- shps[!sf::st_is_empty(shps), ]
+
+# Fix invalid geometries (common with field polygons)
+if (any(!sf::st_is_valid(shps))) {
+  shps <- sf::st_make_valid(shps)
+}
+
+# Match CRS (very important)
+# terra raster CRS -> WKT; sf expects CRS object; use st_crs(EX1) works for terra too.
+if (!sf::st_crs(shps) == sf::st_crs(EX1)) {
+  message("Transforming shapefile CRS to match raster CRS...")
+  shps <- sf::st_transform(shps, sf::st_crs(EX1))
+}
+
+# Convert shapes to terra vector once
+shps_v <- terra::vect(shps)
+
+# ----------------------------
+# 3) Crop + mask to polygons (speed + exact region)
+# ----------------------------
+EX1_exact <- terra::mask(terra::crop(EX1, shps_v), shps_v)
+
+# Optional view
+# FIELDimageR::fieldView(mosaic = EX1_exact, fieldShape = shps, type = 2, alpha = 0.2)
+
+# ----------------------------
+# 4) Remove soil (HUE) using FIELDimageR::fieldMask
+# ----------------------------
+EX1_RemSoil <- FIELDimageR::fieldMask(
+  mosaic = EX1_exact,
+  Red    = 1,
+  Green  = 2,
+  Blue   = 3,
+  index  = "HUE"
+)
+
+# Optional view
+# FIELDimageR::fieldView(mosaic = EX1_RemSoil$newMosaic, fieldShape = shps, type = 2, alpha = 0.2)
+
+# Save masked raster
+out_tif <- file.path(OUT_RAS, "EX1_RemSoil.tif")
+terra::writeRaster(
+  EX1_RemSoil$newMosaic,
+  filename  = out_tif,
+  filetype  = "GTiff",
+  overwrite = TRUE
+)
+message("Saved masked raster: ", out_tif)
+
+# ----------------------------
+# 5) Canopy pixel count per polygon
+# ----------------------------
+EX1_Canopy <- FIELDimageR::fieldArea(mosaic = EX1_RemSoil$newMosaic, fieldShape = shps)
+# EX1_Canopy is a data.frame-like object
+
+out_canopy_csv <- file.path(OUT_TAB, "PixelCount_Canopy.csv")
+write.csv(EX1_Canopy, out_canopy_csv, row.names = FALSE)
+message("Saved canopy pixel counts: ", out_canopy_csv)
+
+# Histogram (only PixelCount >= 100)
+if ("PixelCount" %in% names(EX1_Canopy)) {
+  hist_png <- file.path(OUT_FIG, "PixelCount_hist.png")
+  png(hist_png, width = 1600, height = 1200, res = 200)
+  hist(
+    EX1_Canopy$PixelCount[EX1_Canopy$PixelCount >= 100],
+    main   = "",
+    xlab   = "Pixel count",
+    ylab   = "Frequency",
+    col    = "skyblue",
+    border = "black"
+  )
+  dev.off()
+  message("Saved histogram: ", hist_png)
+} else {
+  warning("PixelCount column not found in EX1_Canopy; histogram not created.")
+}
+
+# ----------------------------
+# 6) RGB indices + per-plot extraction
+# ----------------------------
+EX1_Indices <- FIELDimageR::fieldIndex(
+  mosaic = EX1_RemSoil$newMosaic,
+  Red    = 1,
+  Green  = 2,
+  Blue   = 3
+)
+
+# Ensure shapes are valid/non-empty again (some workflows prefer a cleaned copy)
+shps2 <- shps[!sf::st_is_empty(shps) & sf::st_is_valid(shps), ]
+
+EX1_Info <- FIELDimageR.Extra::fieldInfo_extra(
+  mosaic     = EX1_Indices,
+  fieldShape = shps2,
+  progress   = TRUE
+)
+
+out_rgb_csv <- file.path(OUT_TAB, "RGB_Indices_fieldInfo.csv")
+write.csv(EX1_Info, out_rgb_csv, row.names = FALSE)
+message("Saved RGB indices table: ", out_rgb_csv)
+
+# Print a quick preview for interactive runs
+print(head(EX1_Info, 10))
+
+message("Done.")
